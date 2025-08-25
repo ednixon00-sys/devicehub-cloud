@@ -4,6 +4,7 @@ import { WebSocketServer } from "ws";
 import bodyParser from "body-parser";
 import cors from "cors";
 import url from "url";
+import crypto from "crypto";
 
 const PORT = process.env.PORT || 4000;
 
@@ -14,14 +15,13 @@ app.use(bodyParser.json());
 // Health check
 app.get("/healthz", (_req, res) => res.status(200).send("ok"));
 
-// Track connected devices
-const devices = new Map(); // deviceId -> ws
+// Track connections
+const devices = new Map(); // id -> ws
 
 app.get("/api/devices", (_req, res) => {
   res.json({ online: Array.from(devices.keys()) });
 });
 
-// Send a command to one device
 app.post("/api/command", (req, res) => {
   const { deviceId, command } = req.body || {};
   if (!deviceId || !command) {
@@ -41,38 +41,42 @@ app.post("/api/command", (req, res) => {
 
 const server = http.createServer(app);
 
-// WS server (accept upgrades on ANY path; require ?deviceId=...)
+// WS: accept on ANY path; DO may rewrite/strip parts. Do NOT 400; just log and proceed.
 const wss = new WebSocketServer({ noServer: true });
 
-wss.on("connection", (ws, request, deviceId) => {
-  console.log(`[ws] connected: ${deviceId}`);
-  devices.set(deviceId, ws);
+wss.on("connection", (ws, request, id) => {
+  console.log(`[ws] connected: ${id}`);
+  devices.set(id, ws);
 
   ws.on("message", (msg) => {
-    console.log(`[ws:${deviceId}] ${msg}`);
+    console.log(`[ws:${id}] ${msg.toString()}`);
   });
 
   ws.on("close", () => {
-    console.log(`[ws] closed: ${deviceId}`);
-    devices.delete(deviceId);
+    console.log(`[ws] closed: ${id}`);
+    devices.delete(id);
   });
 });
 
 server.on("upgrade", (request, socket, head) => {
-  const { query } = url.parse(request.url, true);
-  const deviceId = (query.deviceId || "").toString().trim();
+  // Log exactly what DO sent us
+  const parsed = url.parse(request.url || "", true);
+  console.log("[upgrade] url:", request.url);
+  console.log("[upgrade] path:", parsed.pathname, "query:", parsed.query);
 
-  if (!deviceId) {
-    socket.write("HTTP/1.1 400 Bad Request\r\n\r\n");
-    socket.destroy();
-    return;
+  // Prefer ?deviceId=... if present, else build a stable-ish fallback
+  let id = (parsed.query?.deviceId || "").toString().trim();
+  if (!id) {
+    // fallback: use x-forwarded-for + random suffix so we never reject
+    const xff = request.headers["x-forwarded-for"] || request.socket.remoteAddress || "unknown";
+    id = `${xff}-${crypto.randomBytes(3).toString("hex")}`;
   }
 
   wss.handleUpgrade(request, socket, head, (ws) => {
-    wss.emit("connection", ws, request, deviceId);
+    wss.emit("connection", ws, request, id);
   });
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`HTTP+WS server on :${PORT} (any WS path; require ?deviceId=...)`);
+  console.log(`HTTP+WS server on :${PORT} (any WS path; id from ?deviceId or fallback)`);
 });
