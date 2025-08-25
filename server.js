@@ -7,7 +7,6 @@ import url from "url";
 
 const PORT = process.env.PORT || 4000;
 
-// --- HTTP app ---
 const app = express();
 app.use(cors());
 app.use(bodyParser.json());
@@ -15,10 +14,9 @@ app.use(bodyParser.json());
 // Health check
 app.get("/healthz", (_req, res) => res.status(200).send("ok"));
 
-// Map of deviceId -> WebSocket
-const devices = new Map();
+// Track connected devices
+const devices = new Map(); // deviceId -> ws
 
-// List online devices
 app.get("/api/devices", (_req, res) => {
   res.json({ online: Array.from(devices.keys()) });
 });
@@ -41,10 +39,9 @@ app.post("/api/command", (req, res) => {
   }
 });
 
-// --- HTTP server + WS upgrade ---
 const server = http.createServer(app);
 
-// WebSocket server at /ws?deviceId=XYZ
+// WS server (accept upgrades on ANY path; require ?deviceId=...)
 const wss = new WebSocketServer({ noServer: true });
 
 wss.on("connection", (ws, request, deviceId) => {
@@ -62,21 +59,20 @@ wss.on("connection", (ws, request, deviceId) => {
 });
 
 server.on("upgrade", (request, socket, head) => {
-  const { pathname, query } = url.parse(request.url, true);
-  if (pathname === "/ws") {
-    const deviceId = (query.deviceId || "").toString().trim();
-    if (!deviceId) {
-      socket.destroy();
-      return;
-    }
-    wss.handleUpgrade(request, socket, head, (ws) => {
-      wss.emit("connection", ws, request, deviceId);
-    });
-  } else {
+  const { query } = url.parse(request.url, true);
+  const deviceId = (query.deviceId || "").toString().trim();
+
+  if (!deviceId) {
+    socket.write("HTTP/1.1 400 Bad Request\r\n\r\n");
     socket.destroy();
+    return;
   }
+
+  wss.handleUpgrade(request, socket, head, (ws) => {
+    wss.emit("connection", ws, request, deviceId);
+  });
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`HTTP+WS server on http://localhost:${PORT}  (WS path: /ws?deviceId=YOUR_ID)`);
+  console.log(`HTTP+WS server on :${PORT} (any WS path; require ?deviceId=...)`);
 });
