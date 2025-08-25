@@ -1,42 +1,45 @@
 // server.js — HTTPS poll-based command server (no WebSockets)
-// Works perfectly behind DigitalOcean App Platform
-
 import express from "express";
 import bodyParser from "body-parser";
 import cors from "cors";
 
 const PORT = process.env.PORT || 4000;
+const ONLINE_WINDOW_MS = 20_000; // show devices seen in last 20s
 
 const app = express();
 app.use(cors());
 app.use(bodyParser.json());
 
-// In-memory command queues: deviceId -> array of commands
-const queues = new Map();
+// In-memory queues and presence
+const queues = new Map();              // deviceId -> [commands...]
+const lastSeen = new Map();            // deviceId -> timestamp (ms since epoch)
 
 function enqueue(deviceId, command) {
   if (!queues.has(deviceId)) queues.set(deviceId, []);
   queues.get(deviceId).push(command);
 }
-
 function dequeue(deviceId) {
   if (!queues.has(deviceId)) return null;
   const q = queues.get(deviceId);
   if (!q.length) return null;
   return q.shift();
 }
+function markSeen(deviceId) {
+  lastSeen.set(deviceId, Date.now());
+}
 
-// Health check for DO
+// Health
 app.get("/healthz", (_req, res) => res.status(200).send("ok"));
 
-// Device polls here every 2s
+// Device pulls next command; we also record presence here
 app.get("/api/pull", (req, res) => {
   const deviceId = (req.query.deviceId || "").toString().trim();
   if (!deviceId) return res.status(400).json({ error: "deviceId required" });
 
+  markSeen(deviceId);
+
   const cmd = dequeue(deviceId);
   if (!cmd) return res.json({ command: null });
-
   return res.json({ command: cmd });
 });
 
@@ -50,7 +53,17 @@ app.post("/api/command", (req, res) => {
   return res.json({ ok: true });
 });
 
-// (Optional) view queue lengths
+// List devices seen recently
+app.get("/api/devices", (_req, res) => {
+  const now = Date.now();
+  const online = [];
+  for (const [id, ts] of lastSeen.entries()) {
+    if (now - ts <= ONLINE_WINDOW_MS) online.push(id);
+  }
+  res.json({ online });
+});
+
+// (Optional) view queue sizes
 app.get("/api/queues", (_req, res) => {
   const view = {};
   for (const [k, v] of queues.entries()) view[k] = v.length;
