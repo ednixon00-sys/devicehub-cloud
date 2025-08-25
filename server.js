@@ -1,10 +1,9 @@
+// server.js — HTTPS poll-based command server (no WebSockets)
+// Works perfectly behind DigitalOcean App Platform
+
 import express from "express";
-import http from "http";
-import { WebSocketServer } from "ws";
 import bodyParser from "body-parser";
 import cors from "cors";
-import url from "url";
-import crypto from "crypto";
 
 const PORT = process.env.PORT || 4000;
 
@@ -12,71 +11,52 @@ const app = express();
 app.use(cors());
 app.use(bodyParser.json());
 
-// Health check
+// In-memory command queues: deviceId -> array of commands
+const queues = new Map();
+
+function enqueue(deviceId, command) {
+  if (!queues.has(deviceId)) queues.set(deviceId, []);
+  queues.get(deviceId).push(command);
+}
+
+function dequeue(deviceId) {
+  if (!queues.has(deviceId)) return null;
+  const q = queues.get(deviceId);
+  if (!q.length) return null;
+  return q.shift();
+}
+
+// Health check for DO
 app.get("/healthz", (_req, res) => res.status(200).send("ok"));
 
-// Track connections
-const devices = new Map(); // id -> ws
+// Device polls here every 2s
+app.get("/api/pull", (req, res) => {
+  const deviceId = (req.query.deviceId || "").toString().trim();
+  if (!deviceId) return res.status(400).json({ error: "deviceId required" });
 
-app.get("/api/devices", (_req, res) => {
-  res.json({ online: Array.from(devices.keys()) });
+  const cmd = dequeue(deviceId);
+  if (!cmd) return res.json({ command: null });
+
+  return res.json({ command: cmd });
 });
 
+// Admin/API pushes a command for a device
 app.post("/api/command", (req, res) => {
   const { deviceId, command } = req.body || {};
   if (!deviceId || !command) {
     return res.status(400).json({ error: "deviceId and command are required" });
   }
-  const ws = devices.get(deviceId);
-  if (!ws || ws.readyState !== ws.OPEN) {
-    return res.status(404).json({ error: `device ${deviceId} not connected` });
-  }
-  try {
-    ws.send(command);
-    return res.json({ ok: true, sent: { deviceId, command } });
-  } catch (e) {
-    return res.status(500).json({ error: String(e) });
-  }
+  enqueue(deviceId, command);
+  return res.json({ ok: true });
 });
 
-const server = http.createServer(app);
-
-// WS: accept on ANY path; DO may rewrite/strip parts. Do NOT 400; just log and proceed.
-const wss = new WebSocketServer({ noServer: true });
-
-wss.on("connection", (ws, request, id) => {
-  console.log(`[ws] connected: ${id}`);
-  devices.set(id, ws);
-
-  ws.on("message", (msg) => {
-    console.log(`[ws:${id}] ${msg.toString()}`);
-  });
-
-  ws.on("close", () => {
-    console.log(`[ws] closed: ${id}`);
-    devices.delete(id);
-  });
+// (Optional) view queue lengths
+app.get("/api/queues", (_req, res) => {
+  const view = {};
+  for (const [k, v] of queues.entries()) view[k] = v.length;
+  res.json(view);
 });
 
-server.on("upgrade", (request, socket, head) => {
-  // Log exactly what DO sent us
-  const parsed = url.parse(request.url || "", true);
-  console.log("[upgrade] url:", request.url);
-  console.log("[upgrade] path:", parsed.pathname, "query:", parsed.query);
-
-  // Prefer ?deviceId=... if present, else build a stable-ish fallback
-  let id = (parsed.query?.deviceId || "").toString().trim();
-  if (!id) {
-    // fallback: use x-forwarded-for + random suffix so we never reject
-    const xff = request.headers["x-forwarded-for"] || request.socket.remoteAddress || "unknown";
-    id = `${xff}-${crypto.randomBytes(3).toString("hex")}`;
-  }
-
-  wss.handleUpgrade(request, socket, head, (ws) => {
-    wss.emit("connection", ws, request, id);
-  });
-});
-
-server.listen(PORT, "0.0.0.0", () => {
-  console.log(`HTTP+WS server on :${PORT} (any WS path; id from ?deviceId or fallback)`);
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`HTTP polling server running on :${PORT}`);
 });
