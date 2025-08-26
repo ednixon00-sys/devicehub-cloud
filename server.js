@@ -1,10 +1,13 @@
 // server.js — DeviceHub cloud API with presence + admin UI (poll-based)
+// Adds: ADMIN token, Delete device, PowerShell sender (no agent changes needed)
+
 import express from "express";
 import bodyParser from "body-parser";
 import cors from "cors";
 
 const PORT = process.env.PORT || 4000;
 const ONLINE_WINDOW_MS = 30_000; // show "online" if seen within last 30s
+const ADMIN_TOKEN = (process.env.ADMIN_TOKEN || "").trim();
 
 const app = express();
 app.use(cors());
@@ -45,6 +48,15 @@ function markSeen(id, req, partial = {}) {
   });
 }
 
+// ---------------- Admin auth helper ----------------
+function requireAdmin(req, res, next) {
+  // Accept token via header or bearer
+  const h = (req.headers["x-admin-token"] || req.headers["authorization"] || "").toString().trim();
+  const token = h.startsWith("Bearer ") ? h.slice(7) : h;
+  if (ADMIN_TOKEN && token === ADMIN_TOKEN) return next();
+  return res.status(401).json({ error: "auth_required" });
+}
+
 // ---------------- Health ----------------
 app.get("/healthz", (_req, res) => res.status(200).send("ok"));
 
@@ -68,9 +80,11 @@ app.post("/api/heartbeat", (req, res) => {
   res.json({ ok: true });
 });
 
-// Admin/API queues a command for ONE device
+// ---------------- Admin/API (protected) ----------------
+
+// Queue a generic command for ONE device
 // body: { deviceId, command }
-app.post("/api/command", (req, res) => {
+app.post("/api/command", requireAdmin, (req, res) => {
   const { deviceId, command } = req.body || {};
   if (!deviceId || !command) {
     return res.status(400).json({ error: "deviceId and command are required" });
@@ -79,8 +93,20 @@ app.post("/api/command", (req, res) => {
   res.json({ ok: true });
 });
 
+// Queue a *PowerShell* command for ONE device (wraps into a command string)
+app.post("/api/ps", requireAdmin, (req, res) => {
+  const { deviceId, script } = req.body || {};
+  if (!deviceId || !script) {
+    return res.status(400).json({ error: "deviceId and script are required" });
+  }
+  // No agent change needed: agent will execute this like any other command
+  const ps = `powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "${script.replace(/"/g, '\\"')}"`;
+  enqueue(deviceId.toString(), ps);
+  res.json({ ok: true });
+});
+
 // List devices with details
-app.get("/api/devices", (_req, res) => {
+app.get("/api/devices", requireAdmin, (_req, res) => {
   const now = Date.now();
   const list = [];
   for (const info of devices.values()) {
@@ -91,14 +117,23 @@ app.get("/api/devices", (_req, res) => {
   res.json({ devices: list });
 });
 
+// Delete a specific device (also clears its pending queue)
+app.delete("/api/devices/:deviceId", requireAdmin, (req, res) => {
+  const id = (req.params.deviceId || "").toString().trim();
+  if (!id) return res.status(400).json({ error: "deviceId required" });
+  devices.delete(id);
+  queues.delete(id);
+  res.json({ ok: true });
+});
+
 // (Optional) see queue sizes
-app.get("/api/queues", (_req, res) => {
+app.get("/api/queues", requireAdmin, (_req, res) => {
   const view = {};
   for (const [k, v] of queues.entries()) view[k] = v.length;
   res.json(view);
 });
 
-// ---------------- Admin UI (with embedded Cheat Sheet) ----------------
+// ---------------- Admin UI (adds token login + delete + PS) ----------------
 app.get("/admin", (_req, res) => {
   const html = `<!doctype html>
 <html>
@@ -116,77 +151,98 @@ app.get("/admin", (_req, res) => {
     th{text-align:left;color:#9fb2c8}
     .online{color:#16a34a;font-weight:600}
     .offline{color:#ef4444;font-weight:600}
-    .row-actions{display:flex;gap:8px;align-items:center}
-    input[type=text]{width:100%;background:#0b1220;border:1px solid #1f2a37;border-radius:8px;color:#e6edf3;padding:8px}
+    .row-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+    input[type=text],textarea{width:100%;background:#0b1220;border:1px solid #1f2a37;border-radius:8px;color:#e6edf3;padding:8px}
     button{background:#2563eb;border:0;color:white;padding:8px 12px;border-radius:8px;cursor:pointer}
     button:hover{background:#1d4ed8}
-    code{background:#0b1220;padding:2px 6px;border-radius:6px;border:1px solid #1f2a37}
-    .tip{color:#9fb2c8;font-size:13px}
+    .muted{color:#9fb2c8;font-size:13px}
     summary{cursor:pointer}
     .cheatgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:10px}
     .chip{display:inline-block;background:#0b1220;border:1px solid #1f2a37;border-radius:999px;padding:6px 10px;margin:4px 6px;cursor:pointer}
     .chip:hover{border-color:#2a3a4a}
     pre{background:#0b1220;border:1px solid #1f2a37;border-radius:8px;padding:8px;overflow:auto}
+    .login{display:flex;gap:8px;align-items:center;max-width:520px}
   </style>
 </head>
 <body>
   <h1>DeviceHub Admin</h1>
 
-  <div class="card">
-    <div class="tip">Focus a device's input first, then click a cheat-sheet command to auto-insert it.</div>
-    <div style="margin:10px 0;">
-      <button id="refreshBtn">Refresh</button>
+  <div class="card" id="loginCard">
+    <div class="login">
+      <input id="token" type="password" placeholder="Admin token" />
+      <button onclick="login()">Login</button>
+      <span class="muted" id="loginMsg"></span>
     </div>
+  </div>
 
-    <!-- Cheat Sheet -->
-    <details class="card">
-      <summary><strong>📋 Command Cheat Sheet</strong></summary>
-      <div style="margin-top:12px;">
-        <h3>Basic apps</h3>
-        <div class="cheatgrid">
-          <span class="chip" data-cmd="notepad.exe">notepad.exe</span>
-          <span class="chip" data-cmd="calc.exe">calc.exe</span>
-          <span class="chip" data-cmd="mspaint.exe">mspaint.exe</span>
-        </div>
-
-        <h3>Browsers / Kiosk</h3>
-        <div class="cheatgrid">
-          <span class="chip" data-cmd="start msedge.exe --kiosk https://www.bing.com --edge-kiosk-type=fullscreen">Edge kiosk (Bing)</span>
-          <span class="chip" data-cmd="start msedge.exe --kiosk https://walrus-app-y58ft.ondigitalocean.app/admin/ --edge-kiosk-type=public-browsing">Edge kiosk (Admin)</span>
-          <span class="chip" data-cmd="start chrome.exe --kiosk https://www.example.com">Chrome kiosk</span>
-          <span class="chip" data-cmd="taskkill /IM msedge.exe /F">Close Edge kiosk</span>
-        </div>
-
-        <h3>File Explorer / Tools</h3>
-        <div class="cheatgrid">
-          <span class="chip" data-cmd="explorer.exe C:\\">Explorer C:\\</span>
-          <span class="chip" data-cmd="devmgmt.msc">Device Manager</span>
-          <span class="chip" data-cmd="services.msc">Services</span>
-        </div>
-
-        <h3>System actions ⚠️</h3>
-        <div class="cheatgrid">
-          <span class="chip" data-cmd="rundll32.exe user32.dll,LockWorkStation">Lock workstation</span>
-          <span class="chip" data-cmd="shutdown /l">Log off</span>
-          <span class="chip" data-cmd="shutdown /r /t 0">Reboot now</span>
-        </div>
-
-        <h3>Fun / Demos</h3>
-        <div class="cheatgrid">
-          <span class="chip" data-cmd="powershell -c (New-Object Media.SoundPlayer 'C:\\Windows\\Media\\tada.wav').PlaySync()">Play sound</span>
-          <span class="chip" data-cmd="start msedge.exe --kiosk https://youtube.com --edge-kiosk-type=fullscreen">Edge kiosk (YouTube)</span>
+  <div id="app" style="display:none">
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <div class="muted">Authenticated</div>
+        <div>
+          <button onclick="render()">Refresh</button>
+          <button onclick="logout()">Logout</button>
         </div>
       </div>
-    </details>
+    </div>
 
-    <div id="tableWrap"></div>
+    <div class="card">
+      <details class="card">
+        <summary><strong>📋 Command Cheat Sheet</strong></summary>
+        <div style="margin-top:12px;">
+          <h3>Basic apps</h3>
+          <div class="cheatgrid">
+            <span class="chip" data-cmd="notepad.exe">notepad.exe</span>
+            <span class="chip" data-cmd="calc.exe">calc.exe</span>
+            <span class="chip" data-cmd="mspaint.exe">mspaint.exe</span>
+          </div>
+          <h3>Browsers / Kiosk</h3>
+          <div class="cheatgrid">
+            <span class="chip" data-cmd="start msedge.exe --kiosk https://www.bing.com --edge-kiosk-type=fullscreen">Edge kiosk (Bing)</span>
+            <span class="chip" data-cmd="start chrome.exe --kiosk https://www.example.com">Chrome kiosk</span>
+            <span class="chip" data-cmd="taskkill /IM msedge.exe /F">Close Edge kiosk</span>
+          </div>
+          <h3>System actions ⚠️</h3>
+          <div class="cheatgrid">
+            <span class="chip" data-cmd="rundll32.exe user32.dll,LockWorkStation">Lock workstation</span>
+            <span class="chip" data-cmd="shutdown /r /t 0">Reboot now</span>
+          </div>
+        </div>
+      </details>
+
+      <div id="tableWrap"></div>
+    </div>
   </div>
 
 <script>
 let lastFocusedDeviceId = null;
 
+function getToken(){ return sessionStorage.getItem('admin_token') || ''; }
+function setToken(t){ sessionStorage.setItem('admin_token', t); }
+function clearToken(){ sessionStorage.removeItem('admin_token'); }
+
+async function login(){
+  const t = document.getElementById('token').value.trim();
+  if(!t){ document.getElementById('loginMsg').innerText = 'Enter token'; return; }
+  // Try a protected endpoint to validate
+  const ok = await fetch('/api/queues', { headers: { 'x-admin-token': t }}).then(r => r.status !== 401).catch(()=>false);
+  if(ok){
+    setToken(t);
+    document.getElementById('loginCard').style.display = 'none';
+    document.getElementById('app').style.display = 'block';
+    render();
+  } else {
+    document.getElementById('loginMsg').innerText = 'Invalid token';
+  }
+}
+function logout(){
+  clearToken();
+  location.reload();
+}
+
 async function fetchDevices(){
-  const r = await fetch('/api/devices');
+  const r = await fetch('/api/devices', { headers: { 'x-admin-token': getToken() }});
+  if(r.status===401){ logout(); return []; }
   const data = await r.json();
   return data.devices || [];
 }
@@ -200,16 +256,20 @@ async function render(){
   const rows = devices.map(d => {
     const status = d.online ? '<span class="online">ONLINE</span>' : '<span class="offline">OFFLINE</span>';
     const inputId = 'cmd-' + (d.id||'');
+    const psId = 'ps-' + (d.id||'');
     return \`
       <tr>
-        <td><code>\${d.id||''}</code><br/><span class="tip">last seen: \${fmtTime(d.lastSeen)}</span></td>
+        <td><code>\${d.id||''}</code><br/><span class="muted">last seen: \${fmtTime(d.lastSeen)}</span></td>
         <td>\${d.ip||''}</td>
         <td>\${d.username||''}</td>
         <td>\${d.hostname||''}</td>
         <td>\${d.os||''}</td>
         <td class="row-actions">
-          <input type="text" placeholder="e.g. start msedge.exe --kiosk https://example.com" id="\${inputId}" onfocus="lastFocusedDeviceId='\${d.id}'">
+          <input type="text" placeholder="Command (e.g. start msedge.exe ...)" id="\${inputId}" onfocus="lastFocusedDeviceId='\${d.id}'">
           <button onclick="execCmd('\${d.id}', '\${inputId}')">Execute</button>
+          <textarea rows="2" placeholder="PowerShell script" id="\${psId}"></textarea>
+          <button onclick="sendPS('\${d.id}', '\${psId}')">PS ▶</button>
+          <button style="background:#ef4444" onclick="delDev('\${d.id}')">Delete</button>
         </td>
         <td>\${status}</td>
       </tr>\`;
@@ -223,12 +283,25 @@ async function render(){
           <th>Username</th>
           <th>Hostname</th>
           <th>OS</th>
-          <th>Command</th>
+          <th>Actions</th>
           <th>Status</th>
         </tr>
       </thead>
       <tbody>\${rows}</tbody>
     </table>\`;
+
+  // Click-to-insert from cheat sheet into the last focused device input
+  document.addEventListener('click', (e)=>{
+    const chip = e.target.closest('.chip');
+    if(!chip) return;
+    const cmd = chip.getAttribute('data-cmd') || '';
+    if(!lastFocusedDeviceId){
+      alert('Click into a device Command box first, then choose a cheat command.');
+      return;
+    }
+    const input = document.getElementById('cmd-' + lastFocusedDeviceId);
+    if(input){ input.value = cmd; input.focus(); }
+  });
 }
 
 async function execCmd(deviceId, inputId){
@@ -237,29 +310,35 @@ async function execCmd(deviceId, inputId){
   if(!command){ alert('Enter a command'); return; }
   const r = await fetch('/api/command',{
     method:'POST',
-    headers:{'Content-Type':'application/json'},
+    headers:{'Content-Type':'application/json','x-admin-token': getToken()},
     body: JSON.stringify({deviceId, command})
   });
   const j = await r.json();
   if(j.ok){ inp.value=''; alert('Queued'); } else { alert('Error: '+(j.error||'unknown')); }
 }
 
-document.getElementById('refreshBtn').addEventListener('click', render);
+async function sendPS(deviceId, psId){
+  const ta = document.getElementById(psId);
+  const script = (ta.value||'').trim();
+  if(!script){ alert('Enter a PowerShell script'); return; }
+  const r = await fetch('/api/ps',{
+    method:'POST',
+    headers:{'Content-Type':'application/json','x-admin-token': getToken()},
+    body: JSON.stringify({deviceId, script})
+  });
+  const j = await r.json();
+  if(j.ok){ ta.value=''; alert('PS queued'); } else { alert('Error: '+(j.error||'unknown')); }
+}
 
-// Click-to-insert from cheat sheet into the last focused device input
-document.addEventListener('click', (e)=>{
-  const chip = e.target.closest('.chip');
-  if(!chip) return;
-  const cmd = chip.getAttribute('data-cmd') || '';
-  if(!lastFocusedDeviceId){
-    alert('Click into a device Command box first, then choose a cheat command.');
-    return;
-  }
-  const input = document.getElementById('cmd-' + lastFocusedDeviceId);
-  if(input){ input.value = cmd; input.focus(); }
-});
-
-render();
+async function delDev(id){
+  if(!confirm('Delete device ' + id + ' ?')) return;
+  const r = await fetch('/api/devices/' + encodeURIComponent(id), {
+    method:'DELETE',
+    headers:{'x-admin-token': getToken()}
+  });
+  const j = await r.json();
+  if(j.ok){ render(); } else { alert('Delete failed: ' + (j.error||'')); }
+}
 </script>
 </body>
 </html>`;
@@ -270,4 +349,3 @@ render();
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`HTTP polling server running on :${PORT}`);
 });
-
