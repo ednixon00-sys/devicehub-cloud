@@ -12,6 +12,8 @@ import cors from "cors";
 const PORT = process.env.PORT || 4000;
 const ONLINE_WINDOW_MS = 30_000; // device is "online" if seen within 30s
 const ADMIN_TOKEN = (process.env.ADMIN_TOKEN || "").trim();
+// NEW: separate token for stats endpoint (used by lobster dashboard)
+const STATS_TOKEN = (process.env.STATS_TOKEN || "").trim();
 
 const app = express();
 app.use(cors());
@@ -20,6 +22,10 @@ app.use(bodyParser.json());
 // -------- In-memory state --------
 const queues = new Map();   // deviceId -> [commands...]
 const devices = new Map();  // deviceId -> { id, ip, hostname, username, os, lastSeen }
+
+// NEW: track ever-seen and explicitly-deleted ids (for stats)
+const everSeen = new Set();   // device ids we've ever seen in this process lifetime
+const deletedSet = new Set(); // device ids explicitly deleted via admin
 
 function enqueue(deviceId, command) {
   if (!queues.has(deviceId)) queues.set(deviceId, []);
@@ -41,6 +47,10 @@ function markSeen(id, req, partial = {}) {
   const now = Date.now();
   const ip = clientIp(req) || devices.get(id)?.ip || "";
   const prev = devices.get(id) || { id, ip: "", hostname: "", username: "", os: "", lastSeen: 0 };
+
+  // NEW: remember this device was seen at least once
+  everSeen.add(id);
+
   devices.set(id, {
     id,
     ip: ip || prev.ip,
@@ -105,6 +115,10 @@ app.get("/api/devices", requireAdmin, (_req, res) => {
 app.delete("/api/devices/:deviceId", requireAdmin, (req, res) => {
   const id = (req.params.deviceId || "").toString().trim();
   if (!id) return res.status(400).json({ error: "deviceId required" });
+
+  // NEW: mark as deleted for stats
+  deletedSet.add(id);
+
   devices.delete(id);
   queues.delete(id);
   res.json({ ok: true });
@@ -115,6 +129,32 @@ app.get("/api/queues", requireAdmin, (_req, res) => {
   const view = {};
   for (const [k, v] of queues.entries()) view[k] = v.length;
   res.json(view);
+});
+
+// -------- NEW: Stats endpoint (token-protected; used by lobster dashboard) --------
+// GET /stats?token=...  (token must match STATS_TOKEN)
+// Returns: { ts, installed, active, offline, deleted }
+app.get("/stats", (req, res) => {
+  const token = (req.query.token || "").toString();
+  if (!STATS_TOKEN || token !== STATS_TOKEN) {
+    return res.status(403).json({ error: "Forbidden" });
+  }
+
+  const now = Date.now();
+  const list = Array.from(devices.values());
+  const active = list.filter(d => now - d.lastSeen <= ONLINE_WINDOW_MS).length;
+  const offlineFromCurrent = list.length - active;
+
+  // installed: prefer everSeen (ever observed in this process), fallback to current size
+  const installed = everSeen.size > 0 ? everSeen.size : list.length;
+
+  const deleted = deletedSet.size;
+
+  // We report "offline" as those currently tracked but not online.
+  // (If a once-seen device isn't currently in memory, it won't be counted offline until it reappears.)
+  const offline = offlineFromCurrent;
+
+  res.json({ ts: Date.now(), installed, active, offline, deleted });
 });
 
 // -------- Admin UI (no PowerShell) --------
